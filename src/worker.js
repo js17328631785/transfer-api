@@ -58,6 +58,28 @@ export default {
 };
 
 async function handleOpenAI(request, env, path) {
+  const url = new URL(request.url);
+  if (path === "/v1/images/proxy" && request.method === "GET") {
+    const prompt = url.searchParams.get("prompt") || "";
+    const seed = url.searchParams.get("seed") || Math.floor(Math.random() * 1000000);
+    const width = url.searchParams.get("width") || 1024;
+    const height = url.searchParams.get("height") || 1024;
+    const targetUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true&private=true`;
+    try {
+      const imgRes = await fetch(targetUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0"
+        }
+      });
+      const headers = new Headers(CORS_HEADERS);
+      headers.set("Content-Type", imgRes.headers.get("Content-Type") || "image/jpeg");
+      headers.set("Cache-Control", "public, max-age=31536000");
+      return new Response(imgRes.body, { status: imgRes.status, headers });
+    } catch (e) {
+      return errorResponse(500, "proxy_error", e.message || String(e));
+    }
+  }
+
   if ((path === "/v1/key" || path === "/v1/auth-key" || path === "/v1/usage") && request.method === "GET") {
     const rawPath = path === "/v1/usage" ? "/api/usage" : "/api/key";
     return proxyUpstream(request, env, rawPath);
@@ -127,7 +149,8 @@ async function handleOpenAI(request, env, path) {
       height = parseInt(parts[1]) || 1024;
     }
     const seed = Math.floor(Math.random() * 1000000);
-    const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true&private=true`;
+    const origin = new URL(request.url).origin;
+    const imageUrl = `${origin}/v1/images/proxy?prompt=${encodeURIComponent(prompt)}&width=${width}&height=${height}&seed=${seed}`;
     return jsonResponse({
       created: nowSeconds(),
       data: [
@@ -1259,7 +1282,8 @@ function extractImagePrompt(text) {
 function handleDirectImageGenerationChat(request, body, userText) {
   const prompt = extractImagePrompt(userText);
   const seed = Math.floor(Math.random() * 1000000);
-  const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?seed=${seed}&nologo=true&private=true`;
+  const origin = new URL(request.url).origin;
+  const imageUrl = `${origin}/v1/images/proxy?prompt=${encodeURIComponent(prompt)}&seed=${seed}`;
   const markdownText = `![image](${imageUrl})`;
   const created = nowSeconds();
   const id = `chatcmpl_${randomId()}`;
@@ -1315,7 +1339,8 @@ function handleDirectImageGenerationChat(request, body, userText) {
 function handleDirectImageGenerationResponses(request, body, userText) {
   const prompt = extractImagePrompt(userText);
   const seed = Math.floor(Math.random() * 1000000);
-  const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?seed=${seed}&nologo=true&private=true`;
+  const origin = new URL(request.url).origin;
+  const imageUrl = `${origin}/v1/images/proxy?prompt=${encodeURIComponent(prompt)}&seed=${seed}`;
   const markdownText = `![image](${imageUrl})`;
   const created = nowSeconds();
   const id = `resp_${randomId()}`;
@@ -1435,7 +1460,8 @@ function handleDirectImageGenerationResponses(request, body, userText) {
 function handleDirectImageGenerationAnthropic(request, body, userText) {
   const prompt = extractImagePrompt(userText);
   const seed = Math.floor(Math.random() * 1000000);
-  const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?seed=${seed}&nologo=true&private=true`;
+  const origin = new URL(request.url).origin;
+  const imageUrl = `${origin}/v1/images/proxy?prompt=${encodeURIComponent(prompt)}&seed=${seed}`;
   const markdownText = `![image](${imageUrl})`;
   const id = `msg_${randomId()}`;
   const model = body.model || "claude-3-5-sonnet";
