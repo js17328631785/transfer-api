@@ -108,6 +108,28 @@ async function handleOpenAI(request, env, path) {
     return errorResponse(404, "not_found", "This Worker is stateless. Bind KV/R2 if you need persisted OpenAI file retrieval.");
   }
 
+  if (path === "/v1/images/generations" && request.method === "POST") {
+    const body = await readJson(request);
+    const prompt = body.prompt || "";
+    let width = 1024;
+    let height = 1024;
+    if (typeof body.size === "string" && body.size.includes("x")) {
+      const parts = body.size.split("x");
+      width = parseInt(parts[0]) || 1024;
+      height = parseInt(parts[1]) || 1024;
+    }
+    const seed = Math.floor(Math.random() * 1000000);
+    const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true&private=true`;
+    return jsonResponse({
+      created: nowSeconds(),
+      data: [
+        {
+          url: imageUrl
+        }
+      ]
+    });
+  }
+
   if (path === "/v1/embeddings" || path.startsWith("/v1/audio/") || path.startsWith("/v1/images/")) {
     return errorResponse(501, "unsupported_endpoint", `${path} is not exposed by unlimited.surf and cannot be emulated faithfully.`);
   }
@@ -388,7 +410,8 @@ function buildUnlimitedPayload(body, route) {
     };
   }
 
-  const message = body.message || messagesToText(body.messages) || inputToText(body.input) || body.prompt || "";
+  const imgInstruction = "system: When the user asks you to generate, draw, paint, create or design an image/picture (e.g. \"画一个...\", \"生成一张...\"), do not refuse. Simply respond with a Markdown image link in this format: ![image](https://image.pollinations.ai/prompt/{URL_encoded_prompt}?nologo=true&private=true) where {URL_encoded_prompt} must be a highly detailed English prompt describing the requested image, and must be URL encoded (e.g., spaces replaced with %20). Do not write any other conversational text or explanation. Just return the markdown link.\n\n";
+  const message = imgInstruction + (body.message || messagesToText(body.messages) || inputToText(body.input) || body.prompt || "");
   const payload = {
     message,
     model: mapUpstreamModel(body.model),
@@ -411,7 +434,8 @@ function buildAnthropicUnlimitedPayload(body, route) {
     };
   }
 
-  const prompt = anthropicMessagesToText(body);
+  const imgInstruction = "system: When the user asks you to generate, draw, paint, create or design an image/picture (e.g. \"画一个...\", \"生成一张...\"), do not refuse. Simply respond with a Markdown image link in this format: ![image](https://image.pollinations.ai/prompt/{URL_encoded_prompt}?nologo=true&private=true) where {URL_encoded_prompt} must be a highly detailed English prompt describing the requested image, and must be URL encoded (e.g., spaces replaced with %20). Do not write any other conversational text or explanation. Just return the markdown link.\n\n";
+  const prompt = imgInstruction + anthropicMessagesToText(body);
   const payload = {
     message: prompt,
     model: mapUpstreamModel(body.model),
