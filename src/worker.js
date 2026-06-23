@@ -556,6 +556,7 @@ function streamOpenAIChat(upstream, meta) {
 
 function streamOpenAIResponses(upstream, meta) {
   const outputId = `msg_${randomId()}`;
+  let accumulatedText = "";
   return streamUnlimitedEvents(upstream, {
     start(controller) {
       writeSseEvent(controller, "response.created", {
@@ -583,6 +584,7 @@ function streamOpenAIResponses(upstream, meta) {
       });
     },
     delta(controller, text) {
+      accumulatedText += text;
       writeSseEvent(controller, "response.output_text.delta", {
         type: "response.output_text.delta",
         item_id: outputId,
@@ -597,23 +599,57 @@ function streamOpenAIResponses(upstream, meta) {
         item_id: outputId,
         output_index: 0,
         content_index: 0,
-        text: "",
+        text: accumulatedText,
       });
       writeSseEvent(controller, "response.content_part.done", {
         type: "response.content_part.done",
         item_id: outputId,
         output_index: 0,
         content_index: 0,
-        part: { type: "output_text", text: "", annotations: [] },
+        part: { type: "output_text", text: accumulatedText, annotations: [] },
       });
       writeSseEvent(controller, "response.output_item.done", {
         type: "response.output_item.done",
         output_index: 0,
-        item: { id: outputId, type: "message", status: "completed", role: "assistant", content: [] },
+        item: {
+          id: outputId,
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: accumulatedText,
+              annotations: []
+            }
+          ]
+        },
       });
       writeSseEvent(controller, "response.completed", {
         type: "response.completed",
-        response: { id: meta.id, object: "response", created_at: meta.created, status: "completed", model: meta.model },
+        response: {
+          id: meta.id,
+          object: "response",
+          created_at: meta.created,
+          status: "completed",
+          model: meta.model,
+          output: [
+            {
+              id: outputId,
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [
+                {
+                  type: "output_text",
+                  text: accumulatedText,
+                  annotations: []
+                }
+              ]
+            }
+          ],
+          output_text: accumulatedText
+        },
       });
       writeRawSse(controller, "data: [DONE]\n\n");
     },
