@@ -91,7 +91,7 @@ async function handleOpenAI(request, env, path) {
 
   if (path === "/v1/responses" && request.method === "POST") {
     const body = await readJson(request);
-    const userText = inputToText(body.input) || "";
+    const userText = latestUserInputText(body.input) || "";
     if (isImageGenerationRequest(userText)) {
       return handleDirectImageGenerationResponses(request, body, userText);
     }
@@ -1478,4 +1478,21 @@ function handleDirectImageGenerationAnthropic(request, body, userText) {
     stop_sequence: null,
     usage: { input_tokens: 10, output_tokens: 30 }
   });
+}
+
+function latestUserInputText(input) {
+  if (!input) return "";
+  if (typeof input === "string") return input;
+  if (Array.isArray(input)) {
+    for (let i = input.length - 1; i >= 0; i -= 1) {
+      const item = input[i];
+      if (!item) continue;
+      if (typeof item === "string") return item;
+      if (item.type === "input_text") return item.text || "";
+      if (item.type === "message" && (item.role === "user" || !item.role)) return contentToText(item.content);
+      if (item.role === "user") return contentToText(item.content);
+    }
+    return inputToText(input);
+  }
+  return contentToText(input);
 }
