@@ -82,11 +82,19 @@ async function handleOpenAI(request, env, path) {
 
   if (path === "/v1/chat/completions" && request.method === "POST") {
     const body = await readJson(request);
+    const userText = latestUserText(body.messages) || body.message || "";
+    if (isImageGenerationRequest(userText)) {
+      return handleDirectImageGenerationChat(request, body, userText);
+    }
     return openAIChatCompletions(request, env, body);
   }
 
   if (path === "/v1/responses" && request.method === "POST") {
     const body = await readJson(request);
+    const userText = inputToText(body.input) || "";
+    if (isImageGenerationRequest(userText)) {
+      return handleDirectImageGenerationResponses(request, body, userText);
+    }
     return openAIResponses(request, env, body);
   }
 
@@ -264,6 +272,10 @@ async function handleAnthropic(request, env, path) {
 
   if ((anthPath === "/v1/messages" || anthPath === "/messages") && request.method === "POST") {
     const body = await readJson(request);
+    const userText = latestUserText(body.messages) || "";
+    if (isImageGenerationRequest(userText)) {
+      return handleDirectImageGenerationAnthropic(request, body, userText);
+    }
     return anthropicMessages(request, env, body);
   }
 
@@ -1216,4 +1228,254 @@ function mcpInfo(request) {
       setup: `${origin}/v1/setup`,
     },
   };
+}
+
+function isImageGenerationRequest(text) {
+  if (!text) return false;
+  const clean = text.replace(/[\s\p{P}]/gu, "");
+  const patterns = [
+    /画一个/, /画一张/, /画只/, /画个/, /画幅/, /画条/, /画画/, /画图/,
+    /生成.*图片/, /生成.*图像/, /生成.*画/, /生成.*图/,
+    /生个图/, /生张图/, /生幅图/, /绘制.*图片/, /绘制.*图像/
+  ];
+  return patterns.some(p => p.test(clean));
+}
+
+function extractImagePrompt(text) {
+  let p = text;
+  const prefixes = [
+    /^画一个/, /^画一张/, /^画只/, /^画个/, /^画幅/, /^画条/, /^画画/, /^画图/,
+    /^帮我画一个/, /^帮我画一张/, /^帮我画只/, /^帮我画个/, /^帮我画/,
+    /^生成一个/, /^生成一张/, /^生成.*的图片/, /^生成.*的图像/, /^生成/,
+    /^绘制一个/, /^绘制一张/, /^绘制/
+  ];
+  for (const r of prefixes) {
+    p = p.replace(r, "");
+  }
+  p = p.replace(/的图片$/, "").replace(/的图像$/, "").replace(/的画$/, "").replace(/图片$/, "").replace(/图像$/, "");
+  return p.trim() || text;
+}
+
+function handleDirectImageGenerationChat(request, body, userText) {
+  const prompt = extractImagePrompt(userText);
+  const seed = Math.floor(Math.random() * 1000000);
+  const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?seed=${seed}&nologo=true&private=true`;
+  const markdownText = `![image](${imageUrl})`;
+  const created = nowSeconds();
+  const id = `chatcmpl_${randomId()}`;
+  const model = body.model || "gateway-gpt-5";
+
+  if (body.stream) {
+    return sseResponse(new ReadableStream({
+      start(controller) {
+        writeRawSse(controller, `data: ${JSON.stringify({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]
+        })}\n\n`);
+        writeRawSse(controller, `data: ${JSON.stringify({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta: { content: markdownText }, finish_reason: null }]
+        })}\n\n`);
+        writeRawSse(controller, `data: ${JSON.stringify({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+        })}\n\n`);
+        writeRawSse(controller, "data: [DONE]\n\n");
+        controller.close();
+      }
+    }));
+  }
+
+  return jsonResponse({
+    id,
+    object: "chat.completion",
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: markdownText },
+        logprobs: null,
+        finish_reason: "stop"
+      }
+    ],
+    usage: { input_tokens: 10, output_tokens: 30, total_tokens: 40 }
+  });
+}
+
+function handleDirectImageGenerationResponses(request, body, userText) {
+  const prompt = extractImagePrompt(userText);
+  const seed = Math.floor(Math.random() * 1000000);
+  const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?seed=${seed}&nologo=true&private=true`;
+  const markdownText = `![image](${imageUrl})`;
+  const created = nowSeconds();
+  const id = `resp_${randomId()}`;
+  const outputId = `msg_${randomId()}`;
+  const model = body.model || "gateway-gpt-5";
+
+  if (body.stream) {
+    return sseResponse(new ReadableStream({
+      start(controller) {
+        writeSseEvent(controller, "response.created", {
+          type: "response.created",
+          response: { id, object: "response", created_at: created, status: "in_progress", model, output: [] },
+        });
+        writeSseEvent(controller, "response.output_item.added", {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { id: outputId, type: "message", status: "in_progress", role: "assistant", content: [] },
+        });
+        writeSseEvent(controller, "response.content_part.added", {
+          type: "response.content_part.added",
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
+        });
+        writeSseEvent(controller, "response.output_text.delta", {
+          type: "response.output_text.delta",
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          delta: markdownText,
+        });
+        writeSseEvent(controller, "response.output_text.done", {
+          type: "response.output_text.done",
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          text: markdownText,
+        });
+        writeSseEvent(controller, "response.content_part.done", {
+          type: "response.content_part.done",
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: markdownText, annotations: [] },
+        });
+        writeSseEvent(controller, "response.output_item.done", {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: {
+            id: outputId,
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [{ type: "output_text", text: markdownText, annotations: [] }]
+          },
+        });
+        writeSseEvent(controller, "response.completed", {
+          type: "response.completed",
+          response: {
+            id,
+            object: "response",
+            created_at: created,
+            status: "completed",
+            model,
+            output: [{
+              id: outputId,
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text: markdownText, annotations: [] }]
+            }],
+            output_text: markdownText
+          },
+        });
+        writeRawSse(controller, "data: [DONE]\n\n");
+        controller.close();
+      }
+    }));
+  }
+
+  return jsonResponse({
+    id,
+    object: "response",
+    created_at: created,
+    status: "completed",
+    error: null,
+    incomplete_details: null,
+    instructions: body.instructions || null,
+    max_output_tokens: body.max_output_tokens || body.max_tokens || null,
+    model,
+    output: [
+      {
+        id: outputId,
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: markdownText, annotations: [] }],
+      },
+    ],
+    output_text: markdownText,
+    parallel_tool_calls: true,
+    previous_response_id: body.previous_response_id || null,
+    reasoning: body.reasoning || null,
+    store: body.store || false,
+    temperature: body.temperature || null,
+    text: body.text || { format: { type: "text" } },
+    tool_choice: body.tool_choice || "auto",
+    tools: body.tools || [],
+    top_p: body.top_p || null,
+    truncation: body.truncation || "disabled",
+    usage: { input_tokens: 10, output_tokens: 30, total_tokens: 40 },
+    user: body.user || null,
+  });
+}
+
+function handleDirectImageGenerationAnthropic(request, body, userText) {
+  const prompt = extractImagePrompt(userText);
+  const seed = Math.floor(Math.random() * 1000000);
+  const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?seed=${seed}&nologo=true&private=true`;
+  const markdownText = `![image](${imageUrl})`;
+  const id = `msg_${randomId()}`;
+  const model = body.model || "claude-3-5-sonnet";
+
+  if (body.stream) {
+    return sseResponse(new ReadableStream({
+      start(controller) {
+        writeSseEvent(controller, "message_start", {
+          type: "message_start",
+          message: { id, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 30 } }
+        });
+        writeSseEvent(controller, "content_block_start", {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" }
+        });
+        writeSseEvent(controller, "content_block_delta", {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: markdownText }
+        });
+        writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index: 0 });
+        writeSseEvent(controller, "message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null }
+        });
+        writeSseEvent(controller, "message_stop", { type: "message_stop" });
+        controller.close();
+      }
+    }));
+  }
+
+  return jsonResponse({
+    id,
+    type: "message",
+    role: "assistant",
+    model,
+    content: [{ type: "text", text: markdownText }],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: 10, output_tokens: 30 }
+  });
 }
