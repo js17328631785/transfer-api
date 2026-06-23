@@ -107,6 +107,9 @@ async function handleOpenAI(request, env, path) {
   if (path === "/v1/chat/completions" && request.method === "POST") {
     const body = await readJson(request);
     const userText = latestUserText(body.messages) || body.message || "";
+    if (isVideoGenerationRequest(userText)) {
+      return handleDirectVideoGenerationChat(request, env, body, userText);
+    }
     if (isImageGenerationRequest(userText)) {
       return handleDirectImageGenerationChat(request, body, userText);
     }
@@ -116,6 +119,9 @@ async function handleOpenAI(request, env, path) {
   if (path === "/v1/responses" && request.method === "POST") {
     const body = await readJson(request);
     const userText = latestUserInputText(body.input) || "";
+    if (isVideoGenerationRequest(userText)) {
+      return handleDirectVideoGenerationResponses(request, env, body, userText);
+    }
     if (isImageGenerationRequest(userText)) {
       return handleDirectImageGenerationResponses(request, body, userText);
     }
@@ -298,6 +304,9 @@ async function handleAnthropic(request, env, path) {
   if ((anthPath === "/v1/messages" || anthPath === "/messages") && request.method === "POST") {
     const body = await readJson(request);
     const userText = latestUserText(body.messages) || "";
+    if (isVideoGenerationRequest(userText)) {
+      return handleDirectVideoGenerationAnthropic(request, env, body, userText);
+    }
     if (isImageGenerationRequest(userText)) {
       return handleDirectImageGenerationAnthropic(request, body, userText);
     }
@@ -1607,4 +1616,461 @@ async function fetchImageAsBase64(prompt, seed) {
   } catch (e) {
     return null;
   }
+}
+
+function isVideoGenerationRequest(text) {
+  if (!text) return false;
+  const clean = text.replace(/[\s\p{P}]/gu, "");
+  const patterns = [
+    /生成.*视频/, /生成.*动态图/, /生成.*动图/, /生个视频/, /生个动图/,
+    /画个视频/, /画个动图/, /制作.*视频/, /制作.*动图/,
+    /generate.*video/i, /create.*video/i, /make.*video/i, /videoof/i
+  ];
+  return patterns.some(p => p.test(clean));
+}
+
+function extractVideoPrompt(text) {
+  let p = text;
+  const prefixes = [
+    /^生成一个/, /^生成一张/, /^生成/, /^制作一个/, /^制作/,
+    /^帮我生成一个/, /^帮我生成/, /^帮我制作/,
+    /^画一个/, /^画一张/, /^画/
+  ];
+  for (const r of prefixes) {
+    p = p.replace(r, "");
+  }
+  p = p.replace(/的视频$/, "").replace(/的动图$/, "").replace(/视频$/, "").replace(/动图$/, "");
+  return p.trim() || text;
+}
+
+async function fetchVideoAsBase64(prompt, seed, env) {
+  const base_url = "https://lightricks-ltx-video-distilled.hf.space";
+  const sessionHash = Array.from(crypto.getRandomValues(new Uint8Array(6)), b => b.toString(16).padStart(2, "0")).join("");
+  
+  const headers = {
+    "User-Agent": "Mozilla/5.0",
+    "x-gradio-user": "api"
+  };
+  if (env && env.HF_TOKEN) {
+    headers["Authorization"] = `Bearer ${env.HF_TOKEN}`;
+  }
+
+  // 1. Start heartbeat request
+  const heartbeatUrl = `${base_url}/gradio_api/heartbeat/${sessionHash}`;
+  const heartbeatPromise = (async () => {
+    try {
+      const res = await fetch(heartbeatUrl, { headers });
+      if (!res.body) return;
+      const reader = res.body.getReader();
+      while (true) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch (e) {
+      // ignore
+    }
+  })();
+
+  try {
+    // Wait a brief moment for heartbeat connection to establish
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    // 2. Join queue
+    const enhancedPrompt = `${prompt}, highly detailed, masterpiece, 3d render, cinematic lighting`;
+    const payload = {
+      data: [
+        enhancedPrompt,
+        "worst quality, low quality, deformed, blurry",
+        null,
+        null,
+        320,
+        512,
+        "text-to-video",
+        2,
+        9,
+        seed,
+        true,
+        1,
+        true
+      ],
+      fn_index: 4,
+      session_hash: sessionHash
+    };
+
+    const joinRes = await fetch(`${base_url}/gradio_api/queue/join`, {
+      method: "POST",
+      headers: {
+        ...headers,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+    if (!joinRes.ok) return { error: `Join queue failed: HTTP ${joinRes.status}` };
+    const joinBody = await joinRes.json();
+    const eventId = joinBody.event_id;
+    if (!eventId) return { error: "Failed to get event_id from Gradio" };
+
+    // 3. Connect to queue/data
+    const sseRes = await fetch(`${base_url}/gradio_api/queue/data?session_hash=${sessionHash}`, {
+      headers
+    });
+    if (!sseRes.ok) return { error: `Listen queue failed: HTTP ${sseRes.status}` };
+
+    const reader = sseRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let videoUrl = null;
+    let errorMsg = null;
+
+    outerLoop: while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop() || "";
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line.startsWith("data:")) continue;
+        try {
+          const parsed = JSON.parse(line.slice(5).trim());
+          if (parsed.msg === "process_completed") {
+            if (parsed.success && parsed.output && parsed.output.data && parsed.output.data[0]) {
+              const videoObj = parsed.output.data[0].video;
+              if (videoObj && videoObj.url) {
+                videoUrl = videoObj.url;
+              }
+            } else if (parsed.output && parsed.output.error) {
+              errorMsg = parsed.output.error;
+            }
+            break outerLoop;
+          }
+          if (parsed.msg === "unexpected_error") {
+            errorMsg = parsed.message || "Gradio queue returned unexpected_error";
+            break outerLoop;
+          }
+        } catch (err) {
+          // ignore JSON parse errors
+        }
+      }
+    }
+
+    try { reader.cancel(); } catch (e) {}
+
+    if (errorMsg) return { error: errorMsg };
+    if (!videoUrl) return { error: "Video URL not found in completion response" };
+
+    // 4. Fetch video file
+    const videoRes = await fetch(videoUrl);
+    if (!videoRes.ok) return { error: `Fetch video file failed: HTTP ${videoRes.status}` };
+    const videoBuffer = await videoRes.arrayBuffer();
+    const bytes = new Uint8Array(videoBuffer);
+    const base64 = bytesToBase64(bytes);
+    return { base64 };
+  } catch (e) {
+    return { error: e.message || String(e) };
+  }
+}
+
+async function handleDirectVideoGenerationChat(request, env, body, userText) {
+  const prompt = extractVideoPrompt(userText);
+  const seed = Math.floor(Math.random() * 1000000);
+  const created = nowSeconds();
+  const id = `chatcmpl_${randomId()}`;
+  const model = body.model || "gateway-gpt-5";
+
+  if (body.stream) {
+    return sseResponse(new ReadableStream({
+      async start(controller) {
+        writeRawSse(controller, `data: ${JSON.stringify({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]
+        })}\n\n`);
+        
+        const statusText = "🎥 正在为您制作视频，请稍候（通常需要10-15秒）...\n\n";
+        writeRawSse(controller, `data: ${JSON.stringify({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta: { content: statusText }, finish_reason: null }]
+        })}\n\n`);
+
+        const videoResult = await fetchVideoAsBase64(prompt, seed, env);
+        if (videoResult.base64) {
+          const videoMarkdown = `![video](data:video/mp4;base64,${videoResult.base64})`;
+          writeRawSse(controller, `data: ${JSON.stringify({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{ index: 0, delta: { content: videoMarkdown }, finish_reason: null }]
+          })}\n\n`);
+        } else {
+          const errorMsg = videoResult.error || "请重试。";
+          writeRawSse(controller, `data: ${JSON.stringify({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{ index: 0, delta: { content: `❌ 视频生成失败：${errorMsg}` }, finish_reason: null }]
+          })}\n\n`);
+        }
+
+        writeRawSse(controller, `data: ${JSON.stringify({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+        })}\n\n`);
+        writeRawSse(controller, "data: [DONE]\n\n");
+        controller.close();
+      }
+    }));
+  }
+
+  const videoResult = await fetchVideoAsBase64(prompt, seed, env);
+  const markdownText = videoResult.base64 
+    ? `![video](data:video/mp4;base64,${videoResult.base64})` 
+    : `❌ 视频生成失败：${videoResult.error || "请重试。"}`;
+
+  return jsonResponse({
+    id,
+    object: "chat.completion",
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: markdownText },
+        logprobs: null,
+        finish_reason: "stop"
+      }
+    ],
+    usage: { input_tokens: 10, output_tokens: 30, total_tokens: 40 }
+  });
+}
+
+async function handleDirectVideoGenerationResponses(request, env, body, userText) {
+  const prompt = extractVideoPrompt(userText);
+  const seed = Math.floor(Math.random() * 1000000);
+  const created = nowSeconds();
+  const id = `resp_${randomId()}`;
+  const outputId = `msg_${randomId()}`;
+  const model = body.model || "gateway-gpt-5";
+
+  if (body.stream) {
+    return sseResponse(new ReadableStream({
+      async start(controller) {
+        writeSseEvent(controller, "response.created", {
+          type: "response.created",
+          response: { id, object: "response", created_at: created, status: "in_progress", model, output: [] },
+        });
+        writeSseEvent(controller, "response.output_item.added", {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { id: outputId, type: "message", status: "in_progress", role: "assistant", content: [] },
+        });
+        writeSseEvent(controller, "response.content_part.added", {
+          type: "response.content_part.added",
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
+        });
+        
+        const statusText = "🎥 正在为您制作视频，请稍候（通常需要10-15秒）...\n\n";
+        writeSseEvent(controller, "response.output_text.delta", {
+          type: "response.output_text.delta",
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          delta: statusText,
+        });
+
+        const videoResult = await fetchVideoAsBase64(prompt, seed, env);
+        let finalMarkdown = "";
+        if (videoResult.base64) {
+          finalMarkdown = `${statusText}![video](data:video/mp4;base64,${videoResult.base64})`;
+          writeSseEvent(controller, "response.output_text.delta", {
+            type: "response.output_text.delta",
+            item_id: outputId,
+            output_index: 0,
+            content_index: 0,
+            delta: `![video](data:video/mp4;base64,${videoResult.base64})`,
+          });
+        } else {
+          const errorMsg = videoResult.error || "请重试。";
+          finalMarkdown = `${statusText}❌ 视频生成失败：${errorMsg}`;
+          writeSseEvent(controller, "response.output_text.delta", {
+            type: "response.output_text.delta",
+            item_id: outputId,
+            output_index: 0,
+            content_index: 0,
+            delta: `❌ 视频生成失败：${errorMsg}`,
+          });
+        }
+
+        writeSseEvent(controller, "response.output_text.done", {
+          type: "response.output_text.done",
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          text: finalMarkdown,
+        });
+        writeSseEvent(controller, "response.content_part.done", {
+          type: "response.content_part.done",
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: finalMarkdown, annotations: [] },
+        });
+        writeSseEvent(controller, "response.output_item.done", {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: {
+            id: outputId,
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [{ type: "output_text", text: finalMarkdown, annotations: [] }]
+          },
+        });
+        writeSseEvent(controller, "response.completed", {
+          type: "response.completed",
+          response: {
+            id,
+            object: "response",
+            created_at: created,
+            status: "completed",
+            model,
+            output: [{
+              id: outputId,
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text: finalMarkdown, annotations: [] }]
+            }],
+            output_text: finalMarkdown
+          },
+        });
+        writeRawSse(controller, "data: [DONE]\n\n");
+        controller.close();
+      }
+    }));
+  }
+
+  const videoResult = await fetchVideoAsBase64(prompt, seed, env);
+  const markdownText = videoResult.base64 
+    ? `![video](data:video/mp4;base64,${videoResult.base64})` 
+    : `❌ 视频生成失败：${videoResult.error || "请重试。"}`;
+
+  return jsonResponse({
+    id,
+    object: "response",
+    created_at: created,
+    status: "completed",
+    error: null,
+    incomplete_details: null,
+    instructions: body.instructions || null,
+    max_output_tokens: body.max_output_tokens || body.max_tokens || null,
+    model,
+    output: [
+      {
+        id: outputId,
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: markdownText, annotations: [] }],
+      },
+    ],
+    output_text: markdownText,
+    parallel_tool_calls: true,
+    previous_response_id: body.previous_response_id || null,
+    reasoning: body.reasoning || null,
+    store: body.store || false,
+    temperature: body.temperature || null,
+    text: body.text || { format: { type: "text" } },
+    tool_choice: body.tool_choice || "auto",
+    tools: body.tools || [],
+    top_p: body.top_p || null,
+    truncation: body.truncation || "disabled",
+    usage: { input_tokens: 10, output_tokens: 30, total_tokens: 40 },
+    user: body.user || null,
+  });
+}
+
+async function handleDirectVideoGenerationAnthropic(request, env, body, userText) {
+  const prompt = extractVideoPrompt(userText);
+  const seed = Math.floor(Math.random() * 1000000);
+  const id = `msg_${randomId()}`;
+  const model = body.model || "claude-3-5-sonnet";
+
+  if (body.stream) {
+    return sseResponse(new ReadableStream({
+      async start(controller) {
+        writeSseEvent(controller, "message_start", {
+          type: "message_start",
+          message: { id, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 30 } }
+        });
+        writeSseEvent(controller, "content_block_start", {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" }
+        });
+        
+        const statusText = "🎥 正在为您制作视频，请稍候（通常需要10-15秒）...\n\n";
+        writeSseEvent(controller, "content_block_delta", {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: statusText }
+        });
+
+        const videoResult = await fetchVideoAsBase64(prompt, seed, env);
+        if (videoResult.base64) {
+          const videoMarkdown = `![video](data:video/mp4;base64,${videoResult.base64})`;
+          writeSseEvent(controller, "content_block_delta", {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: videoMarkdown }
+          });
+        } else {
+          const errorMsg = videoResult.error || "请重试。";
+          writeSseEvent(controller, "content_block_delta", {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: `❌ 视频生成失败：${errorMsg}` }
+          });
+        }
+
+        writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index: 0 });
+        writeSseEvent(controller, "message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null }
+        });
+        writeSseEvent(controller, "message_stop", { type: "message_stop" });
+        controller.close();
+      }
+    }));
+  }
+
+  const videoResult = await fetchVideoAsBase64(prompt, seed, env);
+  const markdownText = videoResult.base64 
+    ? `![video](data:video/mp4;base64,${videoResult.base64})` 
+    : `❌ 视频生成失败：${videoResult.error || "请重试。"}`;
+
+  return jsonResponse({
+    id,
+    type: "message",
+    role: "assistant",
+    model,
+    content: [{ type: "text", text: markdownText }],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: 10, output_tokens: 30 }
+  });
 }
