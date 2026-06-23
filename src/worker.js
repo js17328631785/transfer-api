@@ -19,8 +19,10 @@ export default {
     const path = normalizePath(url.pathname);
 
     try {
-      const authError = validateWorkerApiKey(request, env);
-      if (authError) return authError;
+      if (path !== "/v1/images/proxy") {
+        const authError = validateWorkerApiKey(request, env);
+        if (authError) return authError;
+      }
 
       if (path === "/" || path === "/health") {
         return jsonResponse(serviceInfo(request, env));
