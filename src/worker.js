@@ -1281,19 +1281,16 @@ function extractImagePrompt(text) {
   return p.trim() || text;
 }
 
-function handleDirectImageGenerationChat(request, body, userText) {
+async function handleDirectImageGenerationChat(request, body, userText) {
   const prompt = extractImagePrompt(userText);
   const seed = Math.floor(Math.random() * 1000000);
-  const origin = new URL(request.url).origin;
-  const imageUrl = `${origin}/v1/images/proxy?prompt=${encodeURIComponent(prompt)}&seed=${seed}`;
-  const markdownText = `![image](${imageUrl})`;
   const created = nowSeconds();
   const id = `chatcmpl_${randomId()}`;
   const model = body.model || "gateway-gpt-5";
 
   if (body.stream) {
     return sseResponse(new ReadableStream({
-      start(controller) {
+      async start(controller) {
         writeRawSse(controller, `data: ${JSON.stringify({
           id,
           object: "chat.completion.chunk",
@@ -1301,13 +1298,36 @@ function handleDirectImageGenerationChat(request, body, userText) {
           model,
           choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]
         })}\n\n`);
+        
+        const statusText = "🎨 正在为您绘制图像，请稍候...\n\n";
         writeRawSse(controller, `data: ${JSON.stringify({
           id,
           object: "chat.completion.chunk",
           created,
           model,
-          choices: [{ index: 0, delta: { content: markdownText }, finish_reason: null }]
+          choices: [{ index: 0, delta: { content: statusText }, finish_reason: null }]
         })}\n\n`);
+
+        const base64 = await fetchImageAsBase64(prompt, seed);
+        if (base64) {
+          const imgMarkdown = `![image](data:image/jpeg;base64,${base64})`;
+          writeRawSse(controller, `data: ${JSON.stringify({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{ index: 0, delta: { content: imgMarkdown }, finish_reason: null }]
+          })}\n\n`);
+        } else {
+          writeRawSse(controller, `data: ${JSON.stringify({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{ index: 0, delta: { content: "❌ 图片生成失败，请重试。" }, finish_reason: null }]
+          })}\n\n`);
+        }
+
         writeRawSse(controller, `data: ${JSON.stringify({
           id,
           object: "chat.completion.chunk",
@@ -1320,6 +1340,9 @@ function handleDirectImageGenerationChat(request, body, userText) {
       }
     }));
   }
+
+  const base64 = await fetchImageAsBase64(prompt, seed);
+  const markdownText = base64 ? `![image](data:image/jpeg;base64,${base64})` : "❌ 图片生成失败，请重试。";
 
   return jsonResponse({
     id,
@@ -1338,12 +1361,9 @@ function handleDirectImageGenerationChat(request, body, userText) {
   });
 }
 
-function handleDirectImageGenerationResponses(request, body, userText) {
+async function handleDirectImageGenerationResponses(request, body, userText) {
   const prompt = extractImagePrompt(userText);
   const seed = Math.floor(Math.random() * 1000000);
-  const origin = new URL(request.url).origin;
-  const imageUrl = `${origin}/v1/images/proxy?prompt=${encodeURIComponent(prompt)}&seed=${seed}`;
-  const markdownText = `![image](${imageUrl})`;
   const created = nowSeconds();
   const id = `resp_${randomId()}`;
   const outputId = `msg_${randomId()}`;
@@ -1351,7 +1371,7 @@ function handleDirectImageGenerationResponses(request, body, userText) {
 
   if (body.stream) {
     return sseResponse(new ReadableStream({
-      start(controller) {
+      async start(controller) {
         writeSseEvent(controller, "response.created", {
           type: "response.created",
           response: { id, object: "response", created_at: created, status: "in_progress", model, output: [] },
@@ -1368,26 +1388,51 @@ function handleDirectImageGenerationResponses(request, body, userText) {
           content_index: 0,
           part: { type: "output_text", text: "", annotations: [] },
         });
+        
+        const statusText = "🎨 正在为您绘制图像，请稍候...\n\n";
         writeSseEvent(controller, "response.output_text.delta", {
           type: "response.output_text.delta",
           item_id: outputId,
           output_index: 0,
           content_index: 0,
-          delta: markdownText,
+          delta: statusText,
         });
+
+        const base64 = await fetchImageAsBase64(prompt, seed);
+        let finalMarkdown = "";
+        if (base64) {
+          finalMarkdown = `${statusText}![image](data:image/jpeg;base64,${base64})`;
+          writeSseEvent(controller, "response.output_text.delta", {
+            type: "response.output_text.delta",
+            item_id: outputId,
+            output_index: 0,
+            content_index: 0,
+            delta: `![image](data:image/jpeg;base64,${base64})`,
+          });
+        } else {
+          finalMarkdown = `${statusText}❌ 图片生成失败，请重试。`;
+          writeSseEvent(controller, "response.output_text.delta", {
+            type: "response.output_text.delta",
+            item_id: outputId,
+            output_index: 0,
+            content_index: 0,
+            delta: "❌ 图片生成失败，请重试。",
+          });
+        }
+
         writeSseEvent(controller, "response.output_text.done", {
           type: "response.output_text.done",
           item_id: outputId,
           output_index: 0,
           content_index: 0,
-          text: markdownText,
+          text: finalMarkdown,
         });
         writeSseEvent(controller, "response.content_part.done", {
           type: "response.content_part.done",
           item_id: outputId,
           output_index: 0,
           content_index: 0,
-          part: { type: "output_text", text: markdownText, annotations: [] },
+          part: { type: "output_text", text: finalMarkdown, annotations: [] },
         });
         writeSseEvent(controller, "response.output_item.done", {
           type: "response.output_item.done",
@@ -1397,7 +1442,7 @@ function handleDirectImageGenerationResponses(request, body, userText) {
             type: "message",
             status: "completed",
             role: "assistant",
-            content: [{ type: "output_text", text: markdownText, annotations: [] }]
+            content: [{ type: "output_text", text: finalMarkdown, annotations: [] }]
           },
         });
         writeSseEvent(controller, "response.completed", {
@@ -1413,9 +1458,9 @@ function handleDirectImageGenerationResponses(request, body, userText) {
               type: "message",
               status: "completed",
               role: "assistant",
-              content: [{ type: "output_text", text: markdownText, annotations: [] }]
+              content: [{ type: "output_text", text: finalMarkdown, annotations: [] }]
             }],
-            output_text: markdownText
+            output_text: finalMarkdown
           },
         });
         writeRawSse(controller, "data: [DONE]\n\n");
@@ -1423,6 +1468,9 @@ function handleDirectImageGenerationResponses(request, body, userText) {
       }
     }));
   }
+
+  const base64 = await fetchImageAsBase64(prompt, seed);
+  const markdownText = base64 ? `![image](data:image/jpeg;base64,${base64})` : "❌ 图片生成失败，请重试。";
 
   return jsonResponse({
     id,
@@ -1459,18 +1507,15 @@ function handleDirectImageGenerationResponses(request, body, userText) {
   });
 }
 
-function handleDirectImageGenerationAnthropic(request, body, userText) {
+async function handleDirectImageGenerationAnthropic(request, body, userText) {
   const prompt = extractImagePrompt(userText);
   const seed = Math.floor(Math.random() * 1000000);
-  const origin = new URL(request.url).origin;
-  const imageUrl = `${origin}/v1/images/proxy?prompt=${encodeURIComponent(prompt)}&seed=${seed}`;
-  const markdownText = `![image](${imageUrl})`;
   const id = `msg_${randomId()}`;
   const model = body.model || "claude-3-5-sonnet";
 
   if (body.stream) {
     return sseResponse(new ReadableStream({
-      start(controller) {
+      async start(controller) {
         writeSseEvent(controller, "message_start", {
           type: "message_start",
           message: { id, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 30 } }
@@ -1480,11 +1525,30 @@ function handleDirectImageGenerationAnthropic(request, body, userText) {
           index: 0,
           content_block: { type: "text", text: "" }
         });
+        
+        const statusText = "🎨 正在为您绘制图像，请稍候...\n\n";
         writeSseEvent(controller, "content_block_delta", {
           type: "content_block_delta",
           index: 0,
-          delta: { type: "text_delta", text: markdownText }
+          delta: { type: "text_delta", text: statusText }
         });
+
+        const base64 = await fetchImageAsBase64(prompt, seed);
+        if (base64) {
+          const imgMarkdown = `![image](data:image/jpeg;base64,${base64})`;
+          writeSseEvent(controller, "content_block_delta", {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: imgMarkdown }
+          });
+        } else {
+          writeSseEvent(controller, "content_block_delta", {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "❌ 图片生成失败，请重试。" }
+          });
+        }
+
         writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index: 0 });
         writeSseEvent(controller, "message_delta", {
           type: "message_delta",
@@ -1495,6 +1559,9 @@ function handleDirectImageGenerationAnthropic(request, body, userText) {
       }
     }));
   }
+
+  const base64 = await fetchImageAsBase64(prompt, seed);
+  const markdownText = base64 ? `![image](data:image/jpeg;base64,${base64})` : "❌ 图片生成失败，请重试。";
 
   return jsonResponse({
     id,
@@ -1523,4 +1590,25 @@ function latestUserInputText(input) {
     return inputToText(input);
   }
   return contentToText(input);
+}
+
+async function fetchImageAsBase64(prompt, seed) {
+  const targetUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=512&height=512&seed=${seed}&nologo=true&private=true`;
+  try {
+    const res = await fetch(targetUrl, {
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
+    if (!res.ok) return null;
+    const buffer = await res.arrayBuffer();
+    
+    let binary = "";
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  } catch (e) {
+    return null;
+  }
 }
