@@ -1261,7 +1261,8 @@ function isImageGenerationRequest(text) {
   const patterns = [
     /画一个/, /画一张/, /画只/, /画个/, /画幅/, /画条/, /画画/, /画图/,
     /生成.*图片/, /生成.*图像/, /生成.*画/, /生成.*图/,
-    /生个图/, /生张图/, /生幅图/, /绘制.*图片/, /绘制.*图像/
+    /生个图/, /生张图/, /生幅图/, /绘制.*图片/, /绘制.*图像/,
+    /draw/i, /generate.*image/i, /create.*image/i, /paint/i, /imageof/i, /pictureof/i
   ];
   return patterns.some(p => p.test(clean));
 }
@@ -1593,21 +1594,16 @@ function latestUserInputText(input) {
 }
 
 async function fetchImageAsBase64(prompt, seed) {
-  const targetUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=512&height=512&seed=${seed}&nologo=true&private=true`;
+  const enhancedPrompt = `${prompt}, highly detailed, 8k resolution, masterpiece`;
+  const targetUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(enhancedPrompt)}?width=512&height=512&seed=${seed}&nologo=true&private=true`;
   try {
     const res = await fetch(targetUrl, {
       headers: { "User-Agent": "Mozilla/5.0" }
     });
     if (!res.ok) return null;
     const buffer = await res.arrayBuffer();
-    
-    let binary = "";
     const bytes = new Uint8Array(buffer);
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary);
+    return bytesToBase64(bytes);
   } catch (e) {
     return null;
   }
