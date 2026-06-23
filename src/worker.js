@@ -410,7 +410,7 @@ function buildUnlimitedPayload(body, route) {
     };
   }
 
-  const imgInstruction = "system: When the user asks you to generate, draw, paint, create or design an image/picture (e.g. \"画一个...\", \"生成一张...\"), do not refuse. Simply respond with a Markdown image link in this format: ![image](https://image.pollinations.ai/prompt/{URL_encoded_prompt}?nologo=true&private=true) where {URL_encoded_prompt} must be a highly detailed English prompt describing the requested image, and must be URL encoded (e.g., spaces replaced with %20). Do not write any other conversational text or explanation. Just return the markdown link.\n\n";
+  const imgInstruction = "system: When the user asks you to generate, draw, paint, create or design an image/picture (e.g. \"画一个...\", \"生成一张...\"), you MUST IMMEDIATELY respond with ONLY a Markdown image link in this format: ![image](https://image.pollinations.ai/prompt/{URL_encoded_prompt}?nologo=true&private=true). You MUST translate the user's request into a highly detailed English description, expand it with rich details (like style, lighting, camera angle), and URL encode it (replace spaces with %20) to use as the {URL_encoded_prompt}. Do NOT write any other text, thoughts, greetings, or explanations. Do NOT ask for clarification, just imagine the details yourself. ONLY return the markdown link.\n\n";
   const message = imgInstruction + (body.message || messagesToText(body.messages) || inputToText(body.input) || body.prompt || "");
   const payload = {
     message,
@@ -434,7 +434,7 @@ function buildAnthropicUnlimitedPayload(body, route) {
     };
   }
 
-  const imgInstruction = "system: When the user asks you to generate, draw, paint, create or design an image/picture (e.g. \"画一个...\", \"生成一张...\"), do not refuse. Simply respond with a Markdown image link in this format: ![image](https://image.pollinations.ai/prompt/{URL_encoded_prompt}?nologo=true&private=true) where {URL_encoded_prompt} must be a highly detailed English prompt describing the requested image, and must be URL encoded (e.g., spaces replaced with %20). Do not write any other conversational text or explanation. Just return the markdown link.\n\n";
+  const imgInstruction = "system: When the user asks you to generate, draw, paint, create or design an image/picture (e.g. \"画一个...\", \"生成一张...\"), you MUST IMMEDIATELY respond with ONLY a Markdown image link in this format: ![image](https://image.pollinations.ai/prompt/{URL_encoded_prompt}?nologo=true&private=true). You MUST translate the user's request into a highly detailed English description, expand it with rich details (like style, lighting, camera angle), and URL encode it (replace spaces with %20) to use as the {URL_encoded_prompt}. Do NOT write any other text, thoughts, greetings, or explanations. Do NOT ask for clarification, just imagine the details yourself. ONLY return the markdown link.\n\n";
   const prompt = imgInstruction + anthropicMessagesToText(body);
   const payload = {
     message: prompt,
